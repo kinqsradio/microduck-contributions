@@ -115,6 +115,8 @@ pub fn beacon_in(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<ChoraleBea
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) use radio::run_reported;
+#[cfg(target_os = "linux")]
 pub use radio::{Sighting, broadcast, run, watch};
 
 #[cfg(target_os = "linux")]
@@ -124,8 +126,9 @@ mod radio {
     use bluer::adv::{Advertisement, Type};
     use bluer::monitor::{Monitor, MonitorEvent, Pattern, RssiSamplingPeriod};
     use duck_ipc_proto::ChoraleBeacon;
+    use duck_ipc_proto::{BlePresenceScan, BleScanMode};
     use futures::StreamExt;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch as status_watch};
 
     use super::{BEACON_INTERVAL_MAX, BEACON_INTERVAL_MIN, beacon_data, beacon_in, scan_pattern};
 
@@ -147,6 +150,50 @@ mod radio {
         pub from: bluer::Address,
         /// When this process saw it. See the module docs for what that is and is not.
         pub at: Instant,
+    }
+
+    #[derive(Clone, Default)]
+    struct ScanObservation {
+        mode: Option<BleScanMode>,
+        followers: usize,
+        last_sighting: Option<Instant>,
+    }
+
+    fn report(
+        sender: &Option<crate::presence::Sender>,
+        status: &duck_ipc_proto::BlePresenceStatus,
+    ) {
+        if let Some(sender) = sender {
+            let mut snapshot = status.clone();
+            snapshot.observed_at = crate::presence::now();
+            sender.send_replace(snapshot);
+        }
+    }
+
+    fn retain_sighting(status: &mut duck_ipc_proto::BlePresenceStatus, at: Option<Instant>) {
+        if let Some(at) = at {
+            status.last_sighting = Some(
+                crate::presence::now()
+                    .saturating_sub(at.elapsed().as_secs().min(i64::MAX as u64) as i64),
+            );
+        }
+    }
+
+    fn disconnected(
+        report_to: &Option<crate::presence::Sender>,
+        status: &mut duck_ipc_proto::BlePresenceStatus,
+        observations: &mut Option<status_watch::Receiver<ScanObservation>>,
+        error: Option<&std::io::Error>,
+    ) {
+        if let Some(rx) = observations.take() {
+            retain_sighting(status, rx.borrow().last_sighting);
+        }
+        status.requested = None;
+        status.scan = BlePresenceScan::Disconnected;
+        if let Some(error) = error {
+            status.last_error = Some(crate::presence::bounded_error(error));
+        }
+        report(report_to, status);
     }
 
     /// Put a beacon on the air, on its own advertising instance.
@@ -198,21 +245,31 @@ mod radio {
         adapter: &bluer::Adapter,
         robot_socket: &std::path::Path,
     ) -> std::io::Result<()> {
-        run_with(
+        run_reported(adapter, robot_socket, None).await
+    }
+
+    pub(crate) async fn run_reported(
+        adapter: &bluer::Adapter,
+        robot_socket: &std::path::Path,
+        report_to: Option<crate::presence::Sender>,
+    ) -> std::io::Result<()> {
+        run_with_status(
             robot_socket,
             |beacon| async move { broadcast(adapter, &beacon).await },
-            |tx| {
+            |tx, observations| {
                 let adapter = adapter.clone();
-                async move { watch(&adapter, tx).await }
+                async move { watch_observed(&adapter, tx, Some(observations)).await }
             },
+            report_to,
         )
         .await
     }
 
     // Keep the socket session real in tests; only advertising and discovery need a radio.
+    #[cfg(test)]
     async fn run_with<A, B, BF, W, WF>(
         robot_socket: &std::path::Path,
-        mut advertise: B,
+        advertise: B,
         mut watch: W,
     ) -> std::io::Result<()>
     where
@@ -221,9 +278,26 @@ mod radio {
         W: FnMut(mpsc::Sender<Sighting>) -> WF,
         WF: std::future::Future<Output = bluer::Result<()>> + Send + 'static,
     {
+        run_with_status(robot_socket, advertise, move |tx, _| watch(tx), None).await
+    }
+
+    async fn run_with_status<A, B, BF, W, WF>(
+        robot_socket: &std::path::Path,
+        mut advertise: B,
+        mut watch: W,
+        report_to: Option<crate::presence::Sender>,
+    ) -> std::io::Result<()>
+    where
+        B: FnMut(ChoraleBeacon) -> BF,
+        BF: std::future::Future<Output = bluer::Result<A>>,
+        W: FnMut(mpsc::Sender<Sighting>, status_watch::Sender<ScanObservation>) -> WF,
+        WF: std::future::Future<Output = bluer::Result<()>> + Send + 'static,
+    {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let stream = tokio::net::UnixStream::connect(robot_socket).await?;
+        let mut status = crate::presence::initial(BlePresenceScan::Off);
+        report(&report_to, &status);
         let (read_half, mut write_half) = stream.into_split();
         let mut lines = BufReader::new(read_half).lines();
 
@@ -244,14 +318,28 @@ mod radio {
         // Each scan gets its own queue so a restart cannot forward its predecessor's sightings.
         let mut listening = tokio::task::JoinSet::new();
         let mut heard_rx: Option<mpsc::Receiver<Sighting>> = None;
+        let mut observations: Option<status_watch::Receiver<ScanObservation>> = None;
         let mut wanted = false;
         let mut retry_at = None;
         let mut retry_delay = SCAN_RETRY_MIN;
+        let mut diagnostic_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        diagnostic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                _ = diagnostic_tick.tick(), if report_to.is_some() => report(&report_to, &status),
                 line = lines.next_line() => {
-                    let Some(line) = line? else { return Ok(()) };
+                    let line = match line {
+                        Ok(Some(line)) => line,
+                        Ok(None) => {
+                            disconnected(&report_to, &mut status, &mut observations, None);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            disconnected(&report_to, &mut status, &mut observations, Some(&error));
+                            return Err(error);
+                        }
+                    };
                     let Ok(request) = serde_json::from_str::<duck_ipc_proto::Request>(&line) else {
                         continue;
                     };
@@ -263,20 +351,32 @@ mod radio {
                     if want.listening && !wanted {
                         retry_delay = SCAN_RETRY_MIN;
                         retry_at = Some(tokio::time::Instant::now());
+                        status.attempts = 0;
+                        status.last_sighting = None;
+                        status.last_error = None;
+                        status.scan = BlePresenceScan::Starting;
                     } else if !want.listening {
                         retry_at = None;
                         heard_rx = None;
+                        status.scan = BlePresenceScan::Off;
                         listening.shutdown().await;
+                        if let Some(rx) = observations.take() {
+                            retain_sighting(&mut status, rx.borrow().last_sighting);
+                        }
                         if wanted {
                             tracing::warn!("chorale: no longer listening");
                         }
                     }
                     wanted = want.listening;
+                    status.requested = Some(wanted);
+                    report(&report_to, &status);
                     // Advertise what was asked for, and nothing when nothing was.
                     _advertisement = match &want.beacon {
                         Some(beacon) => match advertise(beacon.clone()).await {
                             Ok(handle) => Some(handle),
                             Err(e) => {
+                                status.last_error = Some(crate::presence::bounded_error(format_args!("advertise: {e}")));
+                                report(&report_to, &status);
                                 tracing::warn!(error = %e, "chorale: cannot advertise the beacon");
                                 None
                             }
@@ -286,11 +386,23 @@ mod radio {
                 }
                 Some(result) = listening.join_next(), if !listening.is_empty() => {
                     heard_rx = None;
-                    match result {
-                        Ok(lifetime) if lifetime >= SCAN_RETRY_RESET => retry_delay = SCAN_RETRY_MIN,
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!(%error, "chorale: the scan task stopped"),
+                    // A final observation and task completion can be ready together. Retain
+                    // the decoded sighting regardless of which select arm wins.
+                    if let Some(rx) = observations.take() {
+                        retain_sighting(&mut status, rx.borrow().last_sighting);
                     }
+                    match result {
+                        Ok((lifetime, error)) => {
+                            if lifetime >= SCAN_RETRY_RESET { retry_delay = SCAN_RETRY_MIN; }
+                            if let Some(error) = error { status.last_error = Some(error); }
+                        }
+                        Err(error) => {
+                            status.last_error = Some(crate::presence::bounded_error(&error));
+                            tracing::warn!(%error, "chorale: the scan task stopped");
+                        }
+                    }
+                    status.scan = BlePresenceScan::Retrying { delay_ms: retry_delay.as_millis() as u64 };
+                    report(&report_to, &status);
                     retry_at = Some(tokio::time::Instant::now() + retry_delay);
                     tracing::warn!(delay_ms = retry_delay.as_millis() as u64, "chorale: retrying the scan");
                     retry_delay = (retry_delay * 2).min(SCAN_RETRY_MAX);
@@ -304,15 +416,38 @@ mod radio {
                     retry_at = None;
                     let (tx, rx) = mpsc::channel::<Sighting>(64);
                     heard_rx = Some(rx);
-                    let scan = watch(tx);
+                    let (updates, rx) = status_watch::channel(ScanObservation::default());
+                    observations = Some(rx);
+                    status.attempts = status.attempts.saturating_add(1);
+                    status.scan = BlePresenceScan::Starting;
+                    report(&report_to, &status);
+                    let scan = watch(tx, updates);
                     listening.spawn(async move {
                         // Measure in the task: an advertising await may delay reaping it.
                         let started = tokio::time::Instant::now();
-                        if let Err(e) = scan.await {
-                            tracing::warn!(error = %e, "chorale: the scan stopped");
-                        }
-                        started.elapsed()
+                        let error = scan.await.err().map(|error| {
+                            tracing::warn!(%error, "chorale: the scan stopped");
+                            crate::presence::bounded_error(error)
+                        });
+                        (started.elapsed(), error)
                     });
+                }
+                changed = async {
+                    match observations.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        observations = None;
+                    } else if let Some(rx) = observations.as_mut() {
+                        let update = rx.borrow_and_update().clone();
+                        if let Some(mode) = update.mode {
+                            status.scan = BlePresenceScan::Listening { mode, followers: update.followers };
+                        }
+                        retain_sighting(&mut status, update.last_sighting);
+                        report(&report_to, &status);
+                    }
                 }
                 Some(sighting) = async {
                     match heard_rx.as_mut() {
@@ -333,7 +468,8 @@ mod radio {
                     );
                     let mut line = serde_json::to_string(&notify).map_err(std::io::Error::other)?;
                     line.push('\n');
-                    if write_half.write_all(line.as_bytes()).await.is_err() {
+                    if let Err(error) = write_half.write_all(line.as_bytes()).await {
+                        disconnected(&report_to, &mut status, &mut observations, Some(&error));
                         return Ok(());
                     }
                 }
@@ -347,7 +483,15 @@ mod radio {
     /// no monitor to offer — see the module docs for why that is the common case here and what the
     /// fallback costs.
     pub async fn watch(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
-        match monitor(adapter, tx.clone()).await {
+        watch_observed(adapter, tx, None).await
+    }
+
+    async fn watch_observed(
+        adapter: &bluer::Adapter,
+        tx: mpsc::Sender<Sighting>,
+        observations: Option<status_watch::Sender<ScanObservation>>,
+    ) -> bluer::Result<()> {
+        match monitor(adapter, tx.clone(), observations.clone()).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Any failure to *register* falls back; a monitor that registered and then died is a
@@ -357,13 +501,17 @@ mod radio {
                     "chorale: no advertisement monitor (bluetoothd without --experimental?); \
                      falling back to discovery, which scans actively"
                 );
-                discover(adapter, tx).await
+                discover(adapter, tx, observations).await
             }
         }
     }
 
     /// The good path: the controller matches the pattern and only wakes us for beacons.
-    async fn monitor(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
+    async fn monitor(
+        adapter: &bluer::Adapter,
+        tx: mpsc::Sender<Sighting>,
+        observations: Option<status_watch::Sender<ScanObservation>>,
+    ) -> bluer::Result<()> {
         let manager = adapter.monitor().await?;
         let monitor = manager
             .register(Monitor {
@@ -379,6 +527,9 @@ mod radio {
                 ..Default::default()
             })
             .await?;
+        if let Some(tx) = &observations {
+            tx.send_modify(|s| s.mode = Some(BleScanMode::Monitor));
+        }
         tracing::warn!(pattern = ?scan_pattern(), "chorale: listening (monitor)");
 
         let devices = monitor.filter_map(|event| async move {
@@ -387,12 +538,14 @@ mod radio {
                 _ => None,
             }
         });
-        follow_devices(devices, |address| {
+        let follower_observations = observations.clone();
+        follow_devices_observed(devices, observations, |address| {
             let device = adapter.device(address);
             let tx = tx.clone();
+            let observations = follower_observations.clone();
             async move {
                 if let Ok(device) = device {
-                    follow(device, tx).await;
+                    follow(device, tx, observations).await;
                 }
             }
         })
@@ -401,7 +554,11 @@ mod radio {
     }
 
     /// The fallback: ordinary discovery, filtered in the host.
-    async fn discover(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
+    async fn discover(
+        adapter: &bluer::Adapter,
+        tx: mpsc::Sender<Sighting>,
+        observations: Option<status_watch::Sender<ScanObservation>>,
+    ) -> bluer::Result<()> {
         adapter
             .set_discovery_filter(bluer::DiscoveryFilter {
                 transport: bluer::DiscoveryTransport::Le,
@@ -413,6 +570,9 @@ mod radio {
             })
             .await?;
         let events = adapter.discover_devices_with_changes().await?;
+        if let Some(tx) = &observations {
+            tx.send_modify(|s| s.mode = Some(BleScanMode::Discovery));
+        }
         tracing::warn!("chorale: listening (discovery)");
 
         let devices = events.filter_map(|event| async move {
@@ -421,12 +581,14 @@ mod radio {
                 _ => None,
             }
         });
-        follow_devices(devices, |address| {
+        let follower_observations = observations.clone();
+        follow_devices_observed(devices, observations, |address| {
             let device = adapter.device(address);
             let tx = tx.clone();
+            let observations = follower_observations.clone();
             async move {
                 if let Ok(device) = device {
-                    follow(device, tx).await;
+                    follow(device, tx, observations).await;
                 }
             }
         })
@@ -436,8 +598,21 @@ mod radio {
 
     // Both discovery paths own their followers: cancelling a scan must cancel its subscriptions,
     // and repeated DeviceFound events must not multiply delivery of the same beacon.
-    async fn follow_devices<S, F, Fut>(devices: S, mut follow: F)
+    #[cfg(test)]
+    async fn follow_devices<S, F, Fut>(devices: S, follow: F)
     where
+        S: futures::Stream<Item = bluer::Address>,
+        F: FnMut(bluer::Address) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        follow_devices_observed(devices, None, follow).await;
+    }
+
+    async fn follow_devices_observed<S, F, Fut>(
+        devices: S,
+        observations: Option<status_watch::Sender<ScanObservation>>,
+        mut follow: F,
+    ) where
         S: futures::Stream<Item = bluer::Address>,
         F: FnMut(bluer::Address) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -455,11 +630,13 @@ mod radio {
                     }
                     // Keep failures local to one device, just as normal subscription completion.
                     active.retain(|_, task: &mut tokio::task::AbortHandle| !task.is_finished());
+                    if let Some(tx) = &observations { tx.send_modify(|s| s.followers = active.len()); }
                 }
                 address = devices.next() => {
                     let Some(address) = address else { break };
                     if let std::collections::hash_map::Entry::Vacant(entry) = active.entry(address) {
                         entry.insert(followers.spawn(follow(address)));
+                        if let Some(tx) = &observations { tx.send_modify(|s| s.followers = active.len()); }
                     }
                 }
             }
@@ -468,22 +645,32 @@ mod radio {
     }
 
     /// Watch one device's initial advertisement and subsequent manufacturer-data updates.
-    async fn follow(device: bluer::Device, tx: mpsc::Sender<Sighting>) {
+    async fn follow(
+        device: bluer::Device,
+        tx: mpsc::Sender<Sighting>,
+        observations: Option<status_watch::Sender<ScanObservation>>,
+    ) {
         let address = device.address();
         // Whatever it was already advertising when it was found — the first beat is otherwise
         // missed while waiting for a change that has already happened.
         if let Ok(Some(data)) = device.manufacturer_data().await
             && let Some(beacon) = beacon_in(&data)
-            && tx
+        {
+            let at = Instant::now();
+            if let Some(tx) = &observations {
+                tx.send_modify(|s| s.last_sighting = Some(at));
+            }
+            if tx
                 .send(Sighting {
                     beacon,
                     from: address,
-                    at: Instant::now(),
+                    at,
                 })
                 .await
                 .is_err()
-        {
-            return;
+            {
+                return;
+            }
         }
         let Ok(mut events) = device.events().await else {
             return;
@@ -500,6 +687,9 @@ mod radio {
             let Some(beacon) = beacon_in(&data) else {
                 continue;
             };
+            if let Some(tx) = &observations {
+                tx.send_modify(|s| s.last_sighting = Some(at));
+            }
             if tx
                 .send(Sighting {
                     beacon,
@@ -670,6 +860,7 @@ mod radio {
 
         struct ScanAttempt {
             sightings: mpsc::Sender<Sighting>,
+            observations: status_watch::Sender<ScanObservation>,
             finish: oneshot::Sender<bool>,
             finished: oneshot::Receiver<()>,
             started: tokio::time::Instant,
@@ -701,13 +892,17 @@ mod radio {
 
         impl RetrySession {
             async fn new() -> Self {
+                Self::new_reported(None).await
+            }
+
+            async fn new_reported(report_to: Option<crate::presence::Sender>) -> Self {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("robot.sock");
                 let server = tokio::net::UnixListener::bind(&path).unwrap();
                 let (scans_tx, scans) = mpsc::unbounded_channel();
                 let (ads_tx, advertisements) = mpsc::unbounded_channel();
                 let task = tokio::spawn(async move {
-                    run_with(
+                    run_with_status(
                         &path,
                         move |_| {
                             let ads = ads_tx.clone();
@@ -718,7 +913,7 @@ mod radio {
                                 Ok(())
                             }
                         },
-                        move |sightings| {
+                        move |sightings, observations| {
                             let scans = scans_tx.clone();
                             async move {
                                 let (finish, done) = oneshot::channel();
@@ -726,6 +921,7 @@ mod radio {
                                 scans
                                     .send(ScanAttempt {
                                         sightings,
+                                        observations,
                                         finish,
                                         finished,
                                         started: tokio::time::Instant::now(),
@@ -743,6 +939,7 @@ mod radio {
                                 }
                             }
                         },
+                        report_to,
                     )
                     .await
                 });
@@ -801,6 +998,204 @@ mod radio {
                     .unwrap()
                     .unwrap()
             }
+        }
+
+        async fn presence_until(
+            rx: &mut status_watch::Receiver<duck_ipc_proto::BlePresenceStatus>,
+            predicate: impl Fn(&duck_ipc_proto::BlePresenceStatus) -> bool,
+        ) -> duck_ipc_proto::BlePresenceStatus {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = rx.borrow_and_update().clone();
+                    if predicate(&status) {
+                        return status;
+                    }
+                    rx.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        /// Spawned scans are not registered scans; old observations must not cross a retry or off.
+        #[tokio::test]
+        async fn presence_tracks_registration_retry_and_discards_old_observations() {
+            let (tx, mut rx) =
+                status_watch::channel(crate::presence::initial(BlePresenceScan::Disconnected));
+            let mut session = RetrySession::new_reported(Some(tx)).await;
+            presence_until(&mut rx, |s| {
+                matches!(s.scan, BlePresenceScan::Off) && s.requested.is_none()
+            })
+            .await;
+            session.configure(true).await;
+            let first = session.next_scan().await;
+            let starting =
+                presence_until(&mut rx, |s| matches!(s.scan, BlePresenceScan::Starting)).await;
+            assert_eq!((starting.requested, starting.attempts), (Some(true), 1));
+            first.observations.send_modify(|s| {
+                s.mode = Some(BleScanMode::Monitor);
+                s.followers = 2;
+                s.last_sighting = Some(Instant::now() - Duration::from_secs(3));
+            });
+            let listening = presence_until(&mut rx, |s| {
+                matches!(s.scan, BlePresenceScan::Listening { followers: 2, .. })
+            })
+            .await;
+            assert!(crate::presence::now() - listening.last_sighting.unwrap() >= 3);
+            let old = first.observations.clone();
+            first.end().await;
+            let retrying = presence_until(&mut rx, |s| {
+                matches!(s.scan, BlePresenceScan::Retrying { .. })
+            })
+            .await;
+            assert!(
+                retrying
+                    .last_error
+                    .unwrap()
+                    .contains("injected transient scan failure")
+            );
+            let current = session.next_scan().await;
+            current
+                .observations
+                .send_modify(|s| s.mode = Some(BleScanMode::Discovery));
+            let listening = presence_until(&mut rx, |s| {
+                matches!(
+                    s.scan,
+                    BlePresenceScan::Listening {
+                        mode: BleScanMode::Discovery,
+                        followers: 0
+                    }
+                )
+            })
+            .await;
+            assert_eq!(listening.attempts, 2);
+            old.send_modify(|s| {
+                s.mode = Some(BleScanMode::Monitor);
+                s.followers = 99;
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(matches!(
+                rx.borrow().scan,
+                BlePresenceScan::Listening {
+                    mode: BleScanMode::Discovery,
+                    followers: 0
+                }
+            ));
+            session.configure(false).await;
+            presence_until(&mut rx, |s| {
+                matches!(s.scan, BlePresenceScan::Off) && s.requested == Some(false)
+            })
+            .await;
+            assert!(current.finish.is_closed());
+            current.observations.send_modify(|s| {
+                s.mode = Some(BleScanMode::Monitor);
+                s.followers = 99;
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(matches!(rx.borrow().scan, BlePresenceScan::Off));
+        }
+
+        /// Scan completion must retain the final decoded beacon even if join wins selection.
+        #[tokio::test]
+        async fn presence_preserves_a_sighting_published_immediately_before_scan_completion() {
+            for _ in 0..32 {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("robot.sock");
+                let server = tokio::net::UnixListener::bind(&path).unwrap();
+                let (tx, mut rx) =
+                    status_watch::channel(crate::presence::initial(BlePresenceScan::Disconnected));
+                let mut session = tokio::task::JoinSet::new();
+                session.spawn(async move {
+                    run_with_status(
+                        &path,
+                        |_| async { Ok(()) },
+                        |_, observations| async move {
+                            observations.send_modify(|s| s.last_sighting = Some(Instant::now()));
+                            Ok(())
+                        },
+                        Some(tx),
+                    )
+                    .await
+                });
+                let (socket, _) = server.accept().await.unwrap();
+                let (read, mut write) = socket.into_split();
+                let mut lines = BufReader::new(read).lines();
+                lines.next_line().await.unwrap().unwrap();
+                set_listening(&mut write, true).await;
+                let stopped = presence_until(&mut rx, |s| {
+                    matches!(s.scan, BlePresenceScan::Retrying { .. })
+                })
+                .await;
+                assert!(
+                    stopped.last_sighting.is_some(),
+                    "completion discarded a decoded beacon"
+                );
+                session.shutdown().await;
+            }
+        }
+
+        /// Socket EOF can win selection over the final observation after advertising resumes.
+        #[tokio::test]
+        async fn presence_preserves_a_final_sighting_on_socket_eof() {
+            let (tx, mut rx) =
+                status_watch::channel(crate::presence::initial(BlePresenceScan::Disconnected));
+            let mut session = RetrySession::new_reported(Some(tx)).await;
+            session.configure(true).await;
+            let scan = session.next_scan().await;
+            let resume = session.begin_configure(true).await;
+            scan.observations
+                .send_modify(|s| s.last_sighting = Some(Instant::now()));
+            session.write.shutdown().await.unwrap();
+            resume.send(()).unwrap();
+            timeout(Duration::from_secs(1), &mut session.task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                rx.borrow_and_update().scan,
+                BlePresenceScan::Disconnected
+            ));
+            assert!(rx.borrow().last_sighting.is_some());
+            assert!(scan.finish.is_closed());
+        }
+
+        /// The count comes from owned follower tasks, not a second list of nearby ducks.
+        #[tokio::test]
+        async fn presence_follower_count_tracks_deduplication_and_completion() {
+            let (devices, receiver) = mpsc::channel(4);
+            let (updates, mut observations) = status_watch::channel(ScanObservation::default());
+            let (starts, mut started) = mpsc::unbounded_channel();
+            let mut task = tokio::task::JoinSet::new();
+            task.spawn(follow_devices_observed(
+                device_stream(receiver),
+                Some(updates),
+                move |address| {
+                    let starts = starts.clone();
+                    async move {
+                        let (finish, done) = oneshot::channel::<()>();
+                        starts.send((address, finish)).unwrap();
+                        let _ = done.await;
+                    }
+                },
+            ));
+            let first = bluer::Address::new([1, 2, 3, 4, 5, 6]);
+            let second = bluer::Address::new([6, 5, 4, 3, 2, 1]);
+            devices.send(first).await.unwrap();
+            let (_, finish) = started.recv().await.unwrap();
+            assert_eq!(observations.borrow_and_update().followers, 1);
+            devices.send(first).await.unwrap();
+            devices.send(second).await.unwrap();
+            let (address, _keep_alive) = started.recv().await.unwrap();
+            assert_eq!(address, second);
+            assert_eq!(observations.borrow_and_update().followers, 2);
+            finish.send(()).unwrap();
+            timeout(Duration::from_secs(1), observations.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observations.borrow().followers, 1);
+            task.shutdown().await;
         }
 
         /// Repeated failures back off to a cap; a stable scan earns a short retry again.
