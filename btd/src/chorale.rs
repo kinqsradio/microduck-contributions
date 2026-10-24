@@ -52,6 +52,9 @@
 //! Each listening session owns its scan and each scan owns its device followers. Stopping the
 //! session (including a lost robot socket or adapter) cancels those subscriptions. A new session
 //! gets a fresh sighting queue, so buffered events from the old one cannot cross the restart.
+//! While listening is wanted, a stopped scan retries after 250 ms, doubling up to 4 s.
+//! Beacon updates do not bypass that delay. Off/on resets it, as does a scan lasting 30 s;
+//! stopping listening or ending the socket session cancels both the scan and any retry.
 //!
 //! Either way the discriminator is the same: manufacturer-data on company id `0xFFFF` beginning
 //! with [`ChoraleBeacon::TAG`]. That tag is why the *other* advertising instance's four bytes of
@@ -128,6 +131,12 @@ mod radio {
 
     /// AD type for manufacturer-specific data. What the monitor pattern is matched against.
     const AD_TYPE_MANUFACTURER_DATA: u8 = 0xFF;
+
+    // A completed scan (including EOF) is unexpected while listening is wanted. Retry
+    // without needing another beacon request, but never spin on a broken BlueZ service.
+    const SCAN_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+    const SCAN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(4);
+    const SCAN_RETRY_RESET: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// One beacon heard from another duck.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +244,9 @@ mod radio {
         // Each scan gets its own queue so a restart cannot forward its predecessor's sightings.
         let mut listening = tokio::task::JoinSet::new();
         let mut heard_rx: Option<mpsc::Receiver<Sighting>> = None;
+        let mut wanted = false;
+        let mut retry_at = None;
+        let mut retry_delay = SCAN_RETRY_MIN;
 
         loop {
             tokio::select! {
@@ -246,6 +258,20 @@ mod radio {
                     let Ok(duck_ipc_proto::Call::ChoraleBeaconSet(want)) = request.as_call() else {
                         continue;
                     };
+                    // Requests reset the retry budget only on an off/on transition. Heartbeats must
+                    // neither restart a healthy scan nor bypass backoff after a failure.
+                    if want.listening && !wanted {
+                        retry_delay = SCAN_RETRY_MIN;
+                        retry_at = Some(tokio::time::Instant::now());
+                    } else if !want.listening {
+                        retry_at = None;
+                        heard_rx = None;
+                        listening.shutdown().await;
+                        if wanted {
+                            tracing::warn!("chorale: no longer listening");
+                        }
+                    }
+                    wanted = want.listening;
                     // Advertise what was asked for, and nothing when nothing was.
                     _advertisement = match &want.beacon {
                         Some(beacon) => match advertise(beacon.clone()).await {
@@ -257,40 +283,36 @@ mod radio {
                         },
                         None => None,
                     };
-                    // Advertising awaits BlueZ. Reap a scan that ended during that await before
-                    // deciding whether this request needs to start a replacement.
-                    if let Some(result) = listening.try_join_next() {
-                        heard_rx = None;
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "chorale: the scan task stopped");
-                        }
-                    }
-                    // And scan only while asked to. Restarting the monitor on every beat would be
-                    // absurd, so the task is started once and kept until listening stops.
-                    match (want.listening, !listening.is_empty()) {
-                        (true, false) => {
-                            let (tx, rx) = mpsc::channel::<Sighting>(64);
-                            heard_rx = Some(rx);
-                            let scan = watch(tx);
-                            listening.spawn(async move {
-                                if let Err(e) = scan.await {
-                                    tracing::warn!(error = %e, "chorale: the scan stopped");
-                                }
-                            });
-                        }
-                        (false, true) => {
-                            heard_rx = None;
-                            listening.shutdown().await;
-                            tracing::warn!("chorale: no longer listening");
-                        }
-                        _ => {}
-                    }
                 }
                 Some(result) = listening.join_next(), if !listening.is_empty() => {
                     heard_rx = None;
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "chorale: the scan task stopped");
+                    match result {
+                        Ok(lifetime) if lifetime >= SCAN_RETRY_RESET => retry_delay = SCAN_RETRY_MIN,
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(%error, "chorale: the scan task stopped"),
                     }
+                    retry_at = Some(tokio::time::Instant::now() + retry_delay);
+                    tracing::warn!(delay_ms = retry_delay.as_millis() as u64, "chorale: retrying the scan");
+                    retry_delay = (retry_delay * 2).min(SCAN_RETRY_MAX);
+                }
+                () = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if wanted && listening.is_empty() => {
+                    retry_at = None;
+                    let (tx, rx) = mpsc::channel::<Sighting>(64);
+                    heard_rx = Some(rx);
+                    let scan = watch(tx);
+                    listening.spawn(async move {
+                        // Measure in the task: an advertising await may delay reaping it.
+                        let started = tokio::time::Instant::now();
+                        if let Err(e) = scan.await {
+                            tracing::warn!(error = %e, "chorale: the scan stopped");
+                        }
+                        started.elapsed()
+                    });
                 }
                 Some(sighting) = async {
                     match heard_rx.as_mut() {
@@ -632,6 +654,373 @@ mod radio {
         #[tokio::test]
         async fn a_finished_scan_can_be_restarted() {
             restarting_listening_replaces_queue(true).await;
+        }
+
+        /// A wanted scan should recover even if robotd has no new beacon to publish.
+        #[tokio::test]
+        async fn a_finished_scan_recovers_without_another_request() {
+            scan_recovery_without_another_request(false).await;
+        }
+
+        /// A transient radio error must not leave a connected session silently deaf.
+        #[tokio::test]
+        async fn a_failed_scan_recovers_without_another_request() {
+            scan_recovery_without_another_request(true).await;
+        }
+
+        struct ScanAttempt {
+            sightings: mpsc::Sender<Sighting>,
+            finish: oneshot::Sender<bool>,
+            finished: oneshot::Receiver<()>,
+            started: tokio::time::Instant,
+        }
+
+        impl ScanAttempt {
+            async fn end(self) {
+                self.finish.send(true).unwrap();
+                timeout(Duration::from_secs(1), self.sightings.closed())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        struct RetrySession {
+            _dir: tempfile::TempDir,
+            read: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+            write: tokio::net::unix::OwnedWriteHalf,
+            scans: mpsc::UnboundedReceiver<ScanAttempt>,
+            advertisements: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+            task: tokio::task::JoinHandle<std::io::Result<()>>,
+        }
+
+        impl Drop for RetrySession {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        impl RetrySession {
+            async fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("robot.sock");
+                let server = tokio::net::UnixListener::bind(&path).unwrap();
+                let (scans_tx, scans) = mpsc::unbounded_channel();
+                let (ads_tx, advertisements) = mpsc::unbounded_channel();
+                let task = tokio::spawn(async move {
+                    run_with(
+                        &path,
+                        move |_| {
+                            let ads = ads_tx.clone();
+                            async move {
+                                let (resume, resumed) = oneshot::channel();
+                                ads.send(resume).unwrap();
+                                let _ = resumed.await;
+                                Ok(())
+                            }
+                        },
+                        move |sightings| {
+                            let scans = scans_tx.clone();
+                            async move {
+                                let (finish, done) = oneshot::channel();
+                                let (ended, finished) = oneshot::channel();
+                                scans
+                                    .send(ScanAttempt {
+                                        sightings,
+                                        finish,
+                                        finished,
+                                        started: tokio::time::Instant::now(),
+                                    })
+                                    .unwrap();
+                                let fail = done.await.unwrap_or(false);
+                                let _ = ended.send(());
+                                if fail {
+                                    Err(bluer::Error {
+                                        kind: bluer::ErrorKind::Failed,
+                                        message: "injected transient scan failure".into(),
+                                    })
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        },
+                    )
+                    .await
+                });
+                let (socket, _) = timeout(Duration::from_secs(1), server.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (read, write) = socket.into_split();
+                let mut read = BufReader::new(read).lines();
+                timeout(Duration::from_secs(1), read.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                Self {
+                    _dir: dir,
+                    read,
+                    write,
+                    scans,
+                    advertisements,
+                    task,
+                }
+            }
+
+            async fn configure(&mut self, listening: bool) {
+                self.begin_configure(listening).await.send(()).unwrap();
+            }
+
+            async fn begin_configure(&mut self, listening: bool) -> oneshot::Sender<()> {
+                let request = duck_ipc_proto::Request::notify(
+                    &duck_ipc_proto::Call::ChoraleBeaconSet(duck_ipc_proto::ChoraleAdvertise {
+                        beacon: Some(ChoraleBeacon {
+                            piece: 0,
+                            beat: 0,
+                            register: 56,
+                            id: 0x3D,
+                            roster: vec![],
+                        }),
+                        listening,
+                    }),
+                );
+                self.write
+                    .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                // Advertising is invoked after the request's listening state is applied.
+                timeout(Duration::from_secs(1), self.advertisements.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+
+            async fn next_scan(&mut self) -> ScanAttempt {
+                timeout(Duration::from_secs(5), self.scans.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        }
+
+        /// Repeated failures back off to a cap; a stable scan earns a short retry again.
+        #[tokio::test]
+        async fn scan_retry_backoff_is_capped_and_resets_after_a_stable_scan() {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            let mut attempt = session.next_scan().await;
+            tokio::time::pause();
+            for delay in [250, 500, 1000, 2000, 4000, 4000] {
+                attempt.end().await;
+                let ended = tokio::time::Instant::now();
+                attempt = session.next_scan().await;
+                assert_retry_delay(attempt.started - ended, Duration::from_millis(delay));
+            }
+            tokio::time::advance(SCAN_RETRY_RESET).await;
+            attempt.end().await;
+            let ended = tokio::time::Instant::now();
+            let fresh = session.next_scan().await;
+            assert_retry_delay(fresh.started - ended, SCAN_RETRY_MIN);
+        }
+
+        fn assert_retry_delay(elapsed: Duration, expected: Duration) {
+            // Tokio rounds timer deadlines up to its millisecond timer resolution.
+            assert!(
+                (expected..=expected + Duration::from_millis(1)).contains(&elapsed),
+                "retry took {elapsed:?}, expected {expected:?} (plus timer rounding)"
+            );
+        }
+
+        /// Beacon traffic must not turn an unavailable radio into a tight retry loop.
+        #[tokio::test]
+        async fn beacon_requests_do_not_bypass_scan_backoff() {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            let first = session.next_scan().await;
+            let ended = tokio::time::Instant::now();
+            first.end().await;
+            session.configure(true).await;
+            session.configure(true).await;
+            let attempt = session.next_scan().await;
+            assert!(attempt.started - ended >= SCAN_RETRY_MIN);
+            session.configure(true).await;
+            assert!(
+                timeout(SCAN_RETRY_MIN * 2, session.scans.recv())
+                    .await
+                    .is_err(),
+                "a request duplicated the active scan"
+            );
+            assert!(
+                !attempt.sightings.is_closed(),
+                "the original scan lost its queue"
+            );
+            assert!(
+                !attempt.finish.is_closed(),
+                "the original scan was cancelled"
+            );
+        }
+
+        /// Waiting to reap a short scan must not earn the reset reserved for a long-lived scan.
+        #[tokio::test]
+        async fn delayed_advertising_does_not_reset_backoff_for_a_finished_scan() {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            session.next_scan().await.end().await;
+            let short = session.next_scan().await;
+            let resume = session.begin_configure(true).await;
+            tokio::time::pause();
+            // Do not auto-advance the paused clock while waiting for channel barriers.
+            let mut awake = tokio::task::JoinSet::new();
+            awake.spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            short.finish.send(true).unwrap();
+            short.finished.await.unwrap();
+            tokio::time::advance(SCAN_RETRY_RESET * 2).await;
+            resume.send(()).unwrap();
+            timeout(Duration::from_secs(1), short.sightings.closed())
+                .await
+                .unwrap();
+            let reaped = tokio::time::Instant::now();
+            awake.shutdown().await;
+            let next = session.next_scan().await;
+            assert_retry_delay(next.started - reaped, SCAN_RETRY_MIN * 2);
+        }
+
+        /// Turning listening off cancels the timer; turning it on begins a fresh retry budget.
+        #[tokio::test]
+        async fn disabling_listening_cancels_retry_and_reenable_resets_backoff() {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            session.next_scan().await.end().await;
+            session.next_scan().await.end().await; // next delay would be 500 ms
+            session.configure(false).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(
+                session.scans.try_recv().is_err(),
+                "a retry started while listening was off"
+            );
+            session.configure(true).await;
+            let attempt = session.next_scan().await;
+            tokio::time::pause();
+            attempt.end().await;
+            let ended = tokio::time::Instant::now();
+            let attempt = session.next_scan().await;
+            assert_retry_delay(attempt.started - ended, SCAN_RETRY_MIN);
+        }
+
+        enum EndSession {
+            Off,
+            Disconnect,
+            Cancel,
+        }
+
+        async fn end_retry_session(end: EndSession, recovered: bool) {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            session.next_scan().await.end().await;
+            let scan = if recovered {
+                Some(session.next_scan().await)
+            } else {
+                None
+            };
+            match end {
+                EndSession::Off => session.configure(false).await,
+                EndSession::Disconnect => {
+                    session.write.shutdown().await.unwrap();
+                    timeout(Duration::from_secs(1), &mut session.task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                }
+                EndSession::Cancel => {
+                    session.task.abort();
+                    assert!((&mut session.task).await.unwrap_err().is_cancelled());
+                }
+            }
+            if let Some(scan) = scan {
+                timeout(Duration::from_secs(1), scan.sightings.closed())
+                    .await
+                    .unwrap();
+                assert!(
+                    scan.finish.is_closed(),
+                    "the recovered scan task survived cancellation"
+                );
+            }
+            tokio::time::sleep(SCAN_RETRY_MIN * 2).await;
+            assert!(
+                session.scans.try_recv().is_err(),
+                "scan outlived cancellation"
+            );
+        }
+
+        #[tokio::test]
+        async fn disconnect_cancels_pending_scan_retry() {
+            end_retry_session(EndSession::Disconnect, false).await;
+        }
+
+        #[tokio::test]
+        async fn session_cancellation_cancels_pending_scan_retry() {
+            end_retry_session(EndSession::Cancel, false).await;
+        }
+
+        #[tokio::test]
+        async fn disabling_listening_cancels_a_recovered_scan() {
+            end_retry_session(EndSession::Off, true).await;
+        }
+
+        #[tokio::test]
+        async fn disconnect_cancels_a_recovered_scan() {
+            end_retry_session(EndSession::Disconnect, true).await;
+        }
+
+        #[tokio::test]
+        async fn session_cancellation_cancels_a_recovered_scan() {
+            end_retry_session(EndSession::Cancel, true).await;
+        }
+
+        async fn scan_recovery_without_another_request(fail: bool) {
+            let mut session = RetrySession::new().await;
+            session.configure(true).await;
+            let first = session.next_scan().await;
+            first.finish.send(fail).unwrap();
+            timeout(Duration::from_secs(1), first.sightings.closed())
+                .await
+                .unwrap();
+            // Keep the socket connected but send no more beacon requests.
+            let recovered = timeout(Duration::from_secs(2), session.scans.recv())
+                .await
+                .expect("scan did not recover without another request")
+                .unwrap();
+            assert!(!session.task.is_finished());
+            recovered
+                .sightings
+                .send(Sighting {
+                    beacon: ChoraleBeacon {
+                        piece: 2,
+                        beat: 91,
+                        register: 56,
+                        id: 0x3D,
+                        roster: vec![],
+                    },
+                    from: bluer::Address::new([1, 2, 3, 4, 5, 6]),
+                    at: Instant::now(),
+                })
+                .await
+                .unwrap();
+            let line = timeout(Duration::from_secs(1), session.read.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let request: duck_ipc_proto::Request = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                request.as_call().unwrap(),
+                duck_ipc_proto::Call::ChoraleHeard(_)
+            ));
         }
 
         async fn restarting_listening_replaces_queue(finish_scan: bool) {
